@@ -6,25 +6,28 @@
 #include <config/bitcoin-config.h>
 #endif
 
+#include <chainparamsbase.h>
 #include <clientversion.h>
 #include <coins.h>
+#include <common/args.h>
+#include <common/system.h>
 #include <compat/compat.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <core_io.h>
 #include <key_io.h>
-#include <fs.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <script/sign.h>
 #include <script/signingprovider.h>
 #include <univalue.h>
+#include <util/exception.h>
+#include <util/fs.h>
 #include <util/moneystr.h>
 #include <util/rbf.h>
 #include <util/strencodings.h>
 #include <util/string.h>
-#include <util/system.h>
 #include <util/translation.h>
 
 #include <cstdio>
@@ -89,7 +92,7 @@ static int AppInitRawTx(int argc, char* argv[])
 
     // Check for chain settings (Params() calls are only valid after this clause)
     try {
-        SelectParams(gArgs.GetChainName());
+        SelectParams(gArgs.GetChainType());
     } catch (const std::exception& e) {
         tfm::format(std::cerr, "Error: %s\n", e.what());
         return EXIT_FAILURE;
@@ -557,6 +560,16 @@ static CAmount AmountFromValue(const UniValue& value)
     if (!MoneyRange(amount))
         throw std::runtime_error("Amount out of range");
     return amount;
+}
+
+static std::vector<unsigned char> ParseHexUV(const UniValue& v, const std::string& strName)
+{
+    std::string strHex;
+    if (v.isStr())
+        strHex = v.getValStr();
+    if (!IsHex(strHex))
+        throw std::runtime_error(strName + " must be hexadecimal string (not '" + strHex + "')");
+    return ParseHex(strHex);
 }
 
 static void MutateTxSign(CMutableTransaction& tx, const std::string& flagStr)

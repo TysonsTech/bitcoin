@@ -42,12 +42,12 @@ void initialize_tx_pool()
     g_setup = testing_setup.get();
 
     for (int i = 0; i < 2 * COINBASE_MATURITY; ++i) {
-        CTxIn in = MineBlock(g_setup->m_node, P2WSH_OP_TRUE);
+        COutPoint prevout{MineBlock(g_setup->m_node, P2WSH_OP_TRUE)};
         // Remember the txids to avoid expensive disk access later on
         auto& outpoints = i < COINBASE_MATURITY ?
                               g_outpoints_coinbase_init_mature :
                               g_outpoints_coinbase_init_immature;
-        outpoints.push_back(in.prevout);
+        outpoints.push_back(prevout);
     }
     SyncWithValidationInterfaceQueue();
 }
@@ -131,7 +131,7 @@ CTxMemPool MakeMempool(FuzzedDataProvider& fuzzed_data_provider, const NodeConte
     return CTxMemPool{mempool_opts};
 }
 
-FUZZ_TARGET_INIT(tx_pool_standard, initialize_tx_pool)
+FUZZ_TARGET(tx_pool_standard, .init = initialize_tx_pool)
 {
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
     const auto& node = g_setup->m_node;
@@ -227,7 +227,7 @@ FUZZ_TARGET_INIT(tx_pool_standard, initialize_tx_pool)
         }
         if (fuzzed_data_provider.ConsumeBool()) {
             const auto& txid = fuzzed_data_provider.ConsumeBool() ?
-                                   tx->GetHash() :
+                                   tx->GetHash().ToUint256() :
                                    PickValue(fuzzed_data_provider, outpoints_rbf).hash;
             const auto delta = fuzzed_data_provider.ConsumeIntegralInRange<CAmount>(-50 * COIN, +50 * COIN);
             tx_pool.PrioritiseTransaction(txid, delta);
@@ -307,7 +307,7 @@ FUZZ_TARGET_INIT(tx_pool_standard, initialize_tx_pool)
     Finish(fuzzed_data_provider, tx_pool, chainstate);
 }
 
-FUZZ_TARGET_INIT(tx_pool, initialize_tx_pool)
+FUZZ_TARGET(tx_pool, .init = initialize_tx_pool)
 {
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
     const auto& node = g_setup->m_node;
@@ -316,6 +316,7 @@ FUZZ_TARGET_INIT(tx_pool, initialize_tx_pool)
     MockTime(fuzzed_data_provider, chainstate);
 
     std::vector<uint256> txids;
+    txids.reserve(g_outpoints_coinbase_init_mature.size());
     for (const auto& outpoint : g_outpoints_coinbase_init_mature) {
         txids.push_back(outpoint.hash);
     }
@@ -342,8 +343,8 @@ FUZZ_TARGET_INIT(tx_pool, initialize_tx_pool)
             tx_pool.RollingFeeUpdate();
         }
         if (fuzzed_data_provider.ConsumeBool()) {
-            const auto& txid = fuzzed_data_provider.ConsumeBool() ?
-                                   mut_tx.GetHash() :
+            const auto txid = fuzzed_data_provider.ConsumeBool() ?
+                                   mut_tx.GetHash().ToUint256() :
                                    PickValue(fuzzed_data_provider, txids);
             const auto delta = fuzzed_data_provider.ConsumeIntegralInRange<CAmount>(-50 * COIN, +50 * COIN);
             tx_pool.PrioritiseTransaction(txid, delta);

@@ -9,7 +9,6 @@
 
 #include <chainparams.h>
 #include <core_io.h>
-#include <fs.h>
 #include <kernel/mempool_entry.h>
 #include <node/mempool_persist_args.h>
 #include <policy/rbf.h>
@@ -20,6 +19,7 @@
 #include <rpc/util.h>
 #include <txmempool.h>
 #include <univalue.h>
+#include <util/fs.h>
 #include <util/moneystr.h>
 #include <util/time.h>
 
@@ -44,7 +44,11 @@ static RPCHelpMan sendrawtransaction()
             {"hexstring", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The hex string of the raw transaction"},
             {"maxfeerate", RPCArg::Type::AMOUNT, RPCArg::Default{FormatMoney(DEFAULT_MAX_RAW_TX_FEE_RATE.GetFeePerK())},
              "Reject transactions whose fee rate is higher than the specified value, expressed in " + CURRENCY_UNIT +
-                 "/kvB.\nSet to 0 to accept any fee rate.\n"},
+                 "/kvB.\nSet to 0 to accept any fee rate."},
+            {"maxburnamount", RPCArg::Type::AMOUNT, RPCArg::Default{FormatMoney(0)},
+             "Reject transactions with provably unspendable outputs (e.g. 'datacarrier' outputs that use the OP_RETURN opcode) greater than the specified value, expressed in " + CURRENCY_UNIT + ".\n"
+             "If burning funds through unspendable outputs is desired, increase this value.\n"
+             "This check is based on heuristics and does not guarantee spendability of outputs.\n"},
         },
         RPCResult{
             RPCResult::Type::STR_HEX, "", "The transaction hash in hex"
@@ -61,10 +65,19 @@ static RPCHelpMan sendrawtransaction()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
         {
+            const CAmount max_burn_amount = request.params[2].isNull() ? 0 : AmountFromValue(request.params[2]);
+
             CMutableTransaction mtx;
             if (!DecodeHexTx(mtx, request.params[0].get_str())) {
                 throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed. Make sure the tx has at least one input.");
             }
+
+            for (const auto& out : mtx.vout) {
+                if((out.scriptPubKey.IsUnspendable() || !out.scriptPubKey.HasValidOps()) && out.nValue > max_burn_amount) {
+                    throw JSONRPCTransactionError(TransactionError::MAX_BURN_EXCEEDED);
+                }
+            }
+
             CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
 
             const CFeeRate max_raw_tx_fee_rate = request.params[1].isNull() ?
@@ -337,8 +350,8 @@ UniValue MempoolToJSON(const CTxMemPool& pool, bool verbose, bool include_mempoo
             entryToJSON(pool, info, e);
             // Mempool has unique entries so there is no advantage in using
             // UniValue::pushKV, which checks if the key already exists in O(N).
-            // UniValue::__pushKV is used instead which currently is O(1).
-            o.__pushKV(hash.ToString(), info);
+            // UniValue::pushKVEnd is used instead which currently is O(1).
+            o.pushKVEnd(hash.ToString(), info);
         }
         return o;
     } else {
@@ -452,7 +465,7 @@ static RPCHelpMan getmempoolancestors()
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool");
     }
 
-    auto ancestors{mempool.AssumeCalculateMemPoolAncestors(__func__, *it, CTxMemPool::Limits::NoLimits(), /*fSearchForParents=*/false)};
+    auto ancestors{mempool.AssumeCalculateMemPoolAncestors(self.m_name, *it, CTxMemPool::Limits::NoLimits(), /*fSearchForParents=*/false)};
 
     if (!fVerbose) {
         UniValue o(UniValue::VARR);
@@ -624,7 +637,7 @@ static RPCHelpMan gettxspendingprevout()
                                 }, /*fAllowNull=*/false, /*fStrict=*/true);
 
                 const uint256 txid(ParseHashO(o, "txid"));
-                const int nOutput{find_value(o, "vout").getInt<int>()};
+                const int nOutput{o.find_value("vout").getInt<int>()};
                 if (nOutput < 0) {
                     throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, vout cannot be negative");
                 }
@@ -682,7 +695,7 @@ static RPCHelpMan getmempoolinfo()
         RPCResult{
             RPCResult::Type::OBJ, "", "",
             {
-                {RPCResult::Type::BOOL, "loaded", "True if the mempool is fully loaded"},
+                {RPCResult::Type::BOOL, "loaded", "True if the initial load attempt of the persisted mempool finished"},
                 {RPCResult::Type::NUM, "size", "Current tx count"},
                 {RPCResult::Type::NUM, "bytes", "Sum of all virtual transaction sizes as defined in BIP 141. Differs from actual serialized size because witness data is discounted"},
                 {RPCResult::Type::NUM, "usage", "Total memory usage for the mempool"},
@@ -702,6 +715,67 @@ static RPCHelpMan getmempoolinfo()
 {
     return MempoolInfoToJSON(EnsureAnyMemPool(request.context));
 },
+    };
+}
+
+static RPCHelpMan importmempool()
+{
+    return RPCHelpMan{
+        "importmempool",
+        "Import a mempool.dat file and attempt to add its contents to the mempool.\n"
+        "Warning: Importing untrusted files is dangerous, especially if metadata from the file is taken over.",
+        {
+            {"filepath", RPCArg::Type::STR, RPCArg::Optional::NO, "The mempool file"},
+            {"options",
+             RPCArg::Type::OBJ_NAMED_PARAMS,
+             RPCArg::Optional::OMITTED,
+             "",
+             {
+                 {"use_current_time", RPCArg::Type::BOOL, RPCArg::Default{true},
+                  "Whether to use the current system time or use the entry time metadata from the mempool file.\n"
+                  "Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior."},
+                 {"apply_fee_delta_priority", RPCArg::Type::BOOL, RPCArg::Default{false},
+                  "Whether to apply the fee delta metadata from the mempool file.\n"
+                  "It will be added to any existing fee deltas.\n"
+                  "The fee delta can be set by the prioritisetransaction RPC.\n"
+                  "Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior.\n"
+                  "Only set this bool if you understand what it does."},
+                 {"apply_unbroadcast_set", RPCArg::Type::BOOL, RPCArg::Default{false},
+                  "Whether to apply the unbroadcast set metadata from the mempool file.\n"
+                  "Warning: Importing untrusted metadata may lead to unexpected issues and undesirable behavior."},
+             },
+             RPCArgOptions{.oneline_description = "options"}},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", std::vector<RPCResult>{}},
+        RPCExamples{HelpExampleCli("importmempool", "/path/to/mempool.dat") + HelpExampleRpc("importmempool", "/path/to/mempool.dat")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            const NodeContext& node{EnsureAnyNodeContext(request.context)};
+
+            CTxMemPool& mempool{EnsureMemPool(node)};
+            ChainstateManager& chainman = EnsureChainman(node);
+            Chainstate& chainstate = chainman.ActiveChainstate();
+
+            if (chainman.IsInitialBlockDownload()) {
+                throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "Can only import the mempool after the block download and sync is done.");
+            }
+
+            const fs::path load_path{fs::u8path(request.params[0].get_str())};
+            const UniValue& use_current_time{request.params[1]["use_current_time"]};
+            const UniValue& apply_fee_delta{request.params[1]["apply_fee_delta_priority"]};
+            const UniValue& apply_unbroadcast{request.params[1]["apply_unbroadcast_set"]};
+            kernel::ImportMempoolOptions opts{
+                .use_current_time = use_current_time.isNull() ? true : use_current_time.get_bool(),
+                .apply_fee_delta_priority = apply_fee_delta.isNull() ? false : apply_fee_delta.get_bool(),
+                .apply_unbroadcast_set = apply_unbroadcast.isNull() ? false : apply_unbroadcast.get_bool(),
+            };
+
+            if (!kernel::LoadMempool(mempool, load_path, chainstate, std::move(opts))) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Unable to import mempool file, see debug.log for details.");
+            }
+
+            UniValue ret{UniValue::VOBJ};
+            return ret;
+        },
     };
 }
 
@@ -745,11 +819,11 @@ static RPCHelpMan savemempool()
 static RPCHelpMan submitpackage()
 {
     return RPCHelpMan{"submitpackage",
-        "Submit a package of raw transactions (serialized, hex-encoded) to local node (-regtest only).\n"
+        "Submit a package of raw transactions (serialized, hex-encoded) to local node.\n"
+        "The package must consist of a child with its parents, and none of the parents may depend on one another.\n"
         "The package will be validated according to consensus and mempool policy rules. If all transactions pass, they will be accepted to mempool.\n"
         "This RPC is experimental and the interface may be unstable. Refer to doc/policy/packages.md for documentation on package policies.\n"
-        "Warning: until package relay is in use, successful submission does not mean the transaction will propagate to other nodes on the network.\n"
-        "Currently, each transaction is broadcasted individually after submission, which means they must meet other nodes' feerate requirements alone.\n"
+        "Warning: successful submission does not mean the transactions will propagate throughout the network.\n"
         ,
         {
             {"package", RPCArg::Type::ARR, RPCArg::Optional::NO, "An array of raw transactions.",
@@ -788,9 +862,6 @@ static RPCHelpMan submitpackage()
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
         {
-            if (!Params().IsMockableChain()) {
-                throw std::runtime_error("submitpackage is for regression testing (-regtest mode) only");
-            }
             const UniValue raw_transactions = request.params[0].get_array();
             if (raw_transactions.size() < 1 || raw_transactions.size() > MAX_PACKAGE_COUNT) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER,
@@ -806,6 +877,9 @@ static RPCHelpMan submitpackage()
                                        "TX decode failed: " + rawtx.get_str() + " Make sure the tx has at least one input.");
                 }
                 txns.emplace_back(MakeTransactionRef(std::move(mtx)));
+            }
+            if (!IsChildWithParentsTree(txns)) {
+                throw JSONRPCTransactionError(TransactionError::INVALID_PACKAGE, "package topology disallowed. not child-with-parents or parents depend on each other.");
             }
 
             NodeContext& node = EnsureAnyNodeContext(request.context);
@@ -839,15 +913,16 @@ static RPCHelpMan submitpackage()
                     NONFATAL_UNREACHABLE();
                 }
             }
+            size_t num_broadcast{0};
             for (const auto& tx : txns) {
-                size_t num_submitted{0};
                 std::string err_string;
-                const auto err = BroadcastTransaction(node, tx, err_string, 0, true, true);
+                const auto err = BroadcastTransaction(node, tx, err_string, /*max_tx_fee=*/0, /*relay=*/true, /*wait_callback=*/true);
                 if (err != TransactionError::OK) {
                     throw JSONRPCTransactionError(err,
                         strprintf("transaction broadcast failed: %s (all transactions were submitted, %d transactions were broadcast successfully)",
-                            err_string, num_submitted));
+                            err_string, num_broadcast));
                 }
+                num_broadcast++;
             }
             UniValue rpc_result{UniValue::VOBJ};
             UniValue tx_result_map{UniValue::VOBJ};
@@ -906,8 +981,9 @@ void RegisterMempoolRPCCommands(CRPCTable& t)
         {"blockchain", &gettxspendingprevout},
         {"blockchain", &getmempoolinfo},
         {"blockchain", &getrawmempool},
+        {"blockchain", &importmempool},
         {"blockchain", &savemempool},
-        {"hidden", &submitpackage},
+        {"rawtransactions", &submitpackage},
     };
     for (const auto& c : commands) {
         t.appendCommand(c.name, &c);
